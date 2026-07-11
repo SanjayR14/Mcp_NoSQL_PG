@@ -1,0 +1,32 @@
+# OS / editors
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.venv/
+venv/
+.env
+.env.*
+
+# Node
+node_modules/
+
+# Logs
+*.log
+backend/logs/
+
+# Builds / dist
+dist/
+build/
+
+# Env files inside subfolders
+backend/.env
+frontend/.env
+
