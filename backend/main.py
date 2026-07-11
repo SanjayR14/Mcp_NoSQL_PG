@@ -1,12 +1,15 @@
-#  """
-# FastAPI Backend for No-Code SQL Frontend with MCP Integration
-# Architecture:
-# 1. React Frontend → /api/copilotkit (CopilotKit SDK)
-# 2. FastAPI receives query and sends to Azure OpenAI (GPT-4.5)
-# 3. Azure OpenAI responds with tool calls
-# 4. FastAPI forwards tool calls to MCP Server via SSE
-# 5. MCP Server connects to PostgreSQL and returns data
-# 6. FastAPI streams response back to React Frontend
+"""
+FastAPI Backend for No-Code SQL Frontend with MCP Integration
+Architecture:
+1. React Frontend → /api/copilotkit (CopilotKit SDK)
+2. FastAPI receives query and sends to Groq (OpenAI-compatible) LLM
+3. LLM responds with tool calls
+4. FastAPI forwards tool calls to MCP Server
+5. MCP Server connects to PostgreSQL and returns data
+6. FastAPI sends the tool result BACK to the LLM as a tool message so the
+   LLM can turn it into a natural-language answer, then streams that final
+   answer back to the React Frontend.
+"""
 
 import logging
 import json
@@ -127,23 +130,23 @@ async def lifespan(app: FastAPI):
     # Startup
     global mcp_connected
     logger.info("Starting FastAPI application...")
-    
+
     try:
         # Initialize MCP client connection
         mcp_server_url = f"http://127.0.0.1:8001"
         mcp_connected = await initialize_mcp_client(mcp_server_url)
-        
+
         if mcp_connected:
             logger.info(f"✓ Connected to MCP server at {mcp_server_url}")
         else:
             logger.warning(f"✗ Could not connect to MCP server at {mcp_server_url}")
             logger.info("Make sure MCP server is running: python mcp_server/run.py")
-    
+
     except Exception as e:
         logger.error(f"Error during startup: {e}")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down FastAPI application...")
     try:
@@ -258,7 +261,7 @@ async def connect_db(details: ConnectionDetails):
     MCP server uses these environment variables.
     """
     await ensure_mcp_connected()
-    
+
     try:
         logger.info(f"Connection info received for {details.database} at {details.host}:{details.port}")
         db_conn = DatabaseConnection(
@@ -277,7 +280,7 @@ async def connect_db(details: ConnectionDetails):
             )
 
         set_connection_details(details.dict())
-        
+
         return {
             "status": "configured",
             "message": "PostgreSQL connection configured and verified",
@@ -285,7 +288,7 @@ async def connect_db(details: ConnectionDetails):
             "database": details.database,
             "note": "Connection successful. You can now load tables."
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -328,24 +331,24 @@ async def get_available_tools():
     These tools are discovered via MCP protocol.
     """
     await ensure_mcp_connected()
-    
+
     try:
         mcp_client = await get_mcp_client()
         tools = await mcp_client.get_tools()
-        
+
         if not tools:
             raise HTTPException(
                 status_code=503,
                 detail="Could not retrieve tools from MCP server"
             )
-        
+
         return {
             "status": "success",
             "tools": tools,
             "count": len(tools),
             "source": "MCP Server"
         }
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -360,19 +363,19 @@ async def execute_tool_sse(request: ToolCall):
     Streams execution progress back to client.
     """
     await ensure_mcp_connected()
-    
+
     tool_name = request.name
     tool_input = request.input
-    
+
     logger.info(f"Executing tool: {tool_name} with input: {tool_input}")
-    
+
     mcp_client = await get_mcp_client()
-    
+
     # Stream tool execution
     async def generate():
         async for event in mcp_client.call_tool_streaming(tool_name, tool_input):
             yield f"data: {event}\n\n"
-    
+
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
@@ -382,15 +385,15 @@ async def execute_tools_batch(request: ToolExecutionRequest):
     Execute multiple tools via MCP Server in sequence.
     """
     await ensure_mcp_connected()
-    
+
     mcp_client = await get_mcp_client()
-    
+
     # Stream batch execution
     async def generate():
         for tool_call in request.tools:
             async for event in mcp_client.call_tool_streaming(tool_call.name, tool_call.input):
                 yield f"data: {event}\n\n"
-    
+
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
@@ -401,22 +404,22 @@ async def get_database_structure():
     Calls MCP server's list_databases and list_tables tools.
     """
     await ensure_mcp_connected()
-    
+
     try:
         mcp_client = await get_mcp_client()
-        
+
         # Get list of databases
         databases_result = await mcp_client.call_tool("list_databases", {})
         databases = [db.strip() for db in databases_result.split("\n") if db.strip()]
-        
+
         structure = []
-        
+
         # For each database, get its tables
         for db_name in databases:
             try:
                 tables_result = await mcp_client.call_tool("list_tables", {"database": db_name})
                 tables = [table.strip() for table in tables_result.split("\n") if table.strip()]
-                
+
                 structure.append({
                     "name": db_name,
                     "type": "database",
@@ -429,25 +432,15 @@ async def get_database_structure():
                     "type": "database",
                     "children": []
                 })
-        
+
         return {
             "status": "success",
             "structure": structure
         }
-    
+
     except Exception as e:
         logger.error(f"Error getting structure: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-class PreviewRequest(BaseModel):
-    host: str
-    port: int
-    user: str
-    password: str
-    database: str
-    ssl: bool = False
-    table: str
 
 
 @app.post("/api/preview")
@@ -486,55 +479,216 @@ async def get_table_schema_endpoint(database: str, table: str):
     Get schema for a specific table using MCP server.
     """
     await ensure_mcp_connected()
-    
+
     try:
         mcp_client = await get_mcp_client()
         schema_result = await mcp_client.call_tool(
             "get_table_schema",
             {"database": database, "table_name": table}
         )
-        
+
         # Parse schema result
         schema = {}
         for line in schema_result.split("\n"):
             if ": " in line:
                 col_name, col_type = line.split(": ", 1)
                 schema[col_name.strip()] = col_type.strip()
-        
+
         return {
             "status": "success",
             "database": database,
             "table": table,
             "schema": schema
         }
-    
+
     except Exception as e:
         logger.error(f"Error getting schema: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Tool definitions shared by the copilotkit endpoint ---
+_COPILOT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tables",
+            "description": "List all tables in the connected PostgreSQL database.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "database": {"type": "string", "description": "Database name"}
+                },
+                "required": ["database"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_table_schema",
+            "description": "Get column names and types for a table.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "database": {"type": "string", "description": "Database name"},
+                    "table_name": {"type": "string", "description": "Table name"}
+                },
+                "required": ["database", "table_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_query",
+            "description": (
+                "Execute a SQL SELECT query. Use EXACT table and column names "
+                "from the schema in the system message (e.g. department.DEPT_ID, employee.EMAIL)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "database": {"type": "string", "description": "Database name"},
+                    "query": {"type": "string", "description": "SQL SELECT query"}
+                },
+                "required": ["database", "query"]
+            }
+        }
+    }
+]
+
+# Safety cap on how many tool-call <-> tool-result round trips we allow
+# before we give up and tell the user something went wrong.
+_MAX_TOOL_ROUNDS = 3
+
+
+def _openai_sse_chunk(content: str = "", finish_reason: Optional[str] = None) -> str:
+    """Emit a CopilotKit-compatible OpenAI chat completion chunk."""
+    choice: Dict[str, Any] = {"index": 0, "delta": {}}
+    if content:
+        choice["delta"]["content"] = content
+    if finish_reason:
+        choice["finish_reason"] = finish_reason
+    return f"data: {json.dumps({'choices': [choice]})}\n\n"
+
+
+async def _stream_llm_round(msgs: List[Dict[str, Any]], llm_url: str, headers: Dict[str, str]):
+    """
+    Make one streaming call to the LLM.
+
+    Yields tuples of:
+      ("content", text)      -> a chunk of natural-language answer text
+      ("tool_calls", [..])   -> the model wants to call one or more tools
+      ("error", text)        -> something went wrong talking to the LLM
+      ("done", None)         -> stream finished with no tool calls pending
+    """
+    pending_tool_calls: Dict[int, Dict[str, Any]] = {}
+
+    send_payload = {
+        "messages": msgs,
+        "stream": True,
+        "model": settings.groq_model,
+        "tools": _COPILOT_TOOLS,
+    }
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async with client.stream("POST", llm_url, headers=headers, json=send_payload) as resp:
+            if resp.status_code != 200:
+                error_text = await resp.aread()
+                logger.error(f"LLM API Error {resp.status_code}: {error_text}")
+                yield ("error", f"API Error: {resp.status_code}")
+                return
+
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+
+                data = line[6:] if line.startswith("data: ") else line
+
+                if data.strip() == "[DONE]":
+                    if pending_tool_calls:
+                        yield ("tool_calls", [pending_tool_calls[i] for i in sorted(pending_tool_calls)])
+                    else:
+                        yield ("done", None)
+                    return
+
+                try:
+                    chunk = json.loads(data)
+                except Exception as e:
+                    logger.debug(f"Failed to parse JSON: {e}")
+                    continue
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+
+                for choice in choices:
+                    delta = choice.get("delta", {}) or {}
+                    finish_reason = choice.get("finish_reason")
+
+                    if delta.get("tool_calls"):
+                        for tool_call in delta["tool_calls"]:
+                            idx = tool_call.get("index", 0)
+                            if idx not in pending_tool_calls:
+                                pending_tool_calls[idx] = {
+                                    "id": tool_call.get("id"),
+                                    "function": {"name": "", "arguments": ""},
+                                }
+
+                            if tool_call.get("id"):
+                                pending_tool_calls[idx]["id"] = tool_call["id"]
+
+                            function = tool_call.get("function") or {}
+                            if isinstance(function, str):
+                                try:
+                                    function = json.loads(function)
+                                except Exception:
+                                    function = {"name": function, "arguments": ""}
+                            if not isinstance(function, dict):
+                                function = {}
+
+                            if function.get("name"):
+                                pending_tool_calls[idx]["function"]["name"] = function["name"]
+                            if function.get("arguments") is not None:
+                                pending_tool_calls[idx]["function"]["arguments"] += function["arguments"]
+                        continue
+
+                    if finish_reason == "tool_calls":
+                        yield ("tool_calls", [pending_tool_calls[i] for i in sorted(pending_tool_calls)])
+                        return
+
+                    if delta.get("content"):
+                        yield ("content", delta["content"])
+
+
 @app.post("/api/copilotkit")
 async def copilotkit_chat(request: CopilotChatRequest):
     """
-    Main chat endpoint for CopilotKit frontend. Supports Azure OpenAI, OpenAI, and Groq APIs.
-    Streams LLM output and routes tool calls to the MCP engine.
+    Main chat endpoint for CopilotKit frontend (backed by Groq).
+
+    Flow per turn:
+      1. Send the conversation + tool definitions to the LLM.
+      2a. If the LLM answers directly (no tool call) -> stream that text.
+      2b. If the LLM requests tool call(s):
+            - Execute them against the MCP server.
+            - Append the assistant's tool_calls message AND the tool
+              result(s) (role="tool") to the conversation.
+            - Call the LLM again with the updated conversation so it can
+              turn the raw tool result into a natural-language answer
+              (e.g. "Here are the values for your query: ...").
+            - Repeat until the LLM gives a final answer or we hit
+              _MAX_TOOL_ROUNDS.
     """
-    # Use the latest user message (not the first) and pass full chat history to Groq
     user_message, chat_history = _extract_chat_messages(request)
     logger.info("Processing latest user message: %s", user_message)
 
     # Guardrails: block before any tool execution / LLM processing
     decision = check_request(user_prompt=user_message)
     if not decision.allowed:
-        # Do not leak internal details; still required by spec
         raise HTTPException(
             status_code=403,
             detail={"status": "blocked", "reason": "Violates organizational security policy."},
         )
-
-    session_id = request.session_id or "default"
-    context = request.context or {}
-
 
     connected_db = get_connection_details()["database"]
     schema_context = await _load_schema_context()
@@ -547,206 +701,113 @@ async def copilotkit_chat(request: CopilotChatRequest):
             "Answer each new user question independently using a fresh SQL query.\n\n"
             f"{schema_context}\n\n"
             f"Always pass database='{connected_db}' in execute_query calls. "
-            "Write SQL using only the exact table and column names listed above."
+            "Write SQL using only the exact table and column names listed above.\n\n"
+            "IMPORTANT: After a tool returns data, NEVER show raw JSON or the raw tool "
+            "output to the user. Always respond in clear, friendly natural language "
+            "(e.g. 'Here are the values for your query: ...'), summarizing the results "
+            "as a short sentence, bullet list, or simple table as appropriate."
         ),
     }
 
-    # Build messages for LLM: system prompt + full conversation history
-    messages = [system_message, *chat_history]
+    messages: List[Dict[str, Any]] = [system_message, *chat_history]
 
-    # Base payload
-    payload = {
-        "messages": messages,
-        "stream": True,
-    }
-
-    # Tools configuration (for OpenAI/Azure)
-    # NOTE: MCP server tool name is `execute_query`, not `execute_sql_query`.
-    # Keep LLM tool interface compatible with existing logic by exposing the MCP name.
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "list_tables",
-                "description": "List all tables in the connected PostgreSQL database.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "database": {"type": "string", "description": "Database name"}
-                    },
-                    "required": ["database"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "get_table_schema",
-                "description": "Get column names and types for a table.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "database": {"type": "string", "description": "Database name"},
-                        "table_name": {"type": "string", "description": "Table name"}
-                    },
-                    "required": ["database", "table_name"]
-                }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "execute_query",
-                "description": (
-                    "Execute a SQL SELECT query. Use EXACT table and column names "
-                    "from the schema in the system message (e.g. department.DEPT_ID, employee.EMAIL)."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "database": {"type": "string", "description": "Database name"},
-                        "query": {"type": "string", "description": "SQL SELECT query"}
-                    },
-                    "required": ["database", "query"]
-                }
-            }
-        }
-    ]
-
-    # Force Groq usage everywhere
     if not getattr(settings, "groq_api_key", ""):
         raise HTTPException(status_code=500, detail="No GROQ_API_KEY configured")
 
     llm_url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {"Authorization": f"Bearer {settings.groq_api_key}", "Content-Type": "application/json"}
 
-    # Groq follows OpenAI-compatible schema; keep tools enabled.
-    send_payload = {**payload, "model": settings.groq_model, "tools": tools}
-
-    def _openai_sse_chunk(content: str = "", finish_reason: Optional[str] = None) -> str:
-        """Emit a CopilotKit-compatible OpenAI chat completion chunk."""
-        choice: Dict[str, Any] = {"index": 0, "delta": {}}
-        if content:
-            choice["delta"]["content"] = content
-        if finish_reason:
-            choice["finish_reason"] = finish_reason
-        return f"data: {json.dumps({'choices': [choice]})}\n\n"
-
     async def chat_stream():
-        pending_tool_calls: Dict[int, Dict[str, Any]] = {}
-        tools_executed = False
-
-        async def execute_pending_tool_calls():
-            nonlocal tools_executed
-            if tools_executed or not pending_tool_calls:
-                return
-            tools_executed = True
-            for idx in sorted(pending_tool_calls.keys()):
-                tool_call = pending_tool_calls[idx]
-                function = tool_call.get("function") or {}
-                if isinstance(function, str):
-                    try:
-                        function = json.loads(function)
-                    except Exception:
-                        function = {"name": function, "arguments": ""}
-                if not isinstance(function, dict):
-                    continue
-
-                tool_name = function.get("name")
-                if not tool_name:
-                    continue
-
-                raw_args = function.get("arguments", "")
-                if isinstance(raw_args, dict):
-                    tool_args = raw_args
-                else:
-                    tool_args = _normalize_tool_input(raw_args or {})
-
-                mcp_client = await get_mcp_client()
-                result = await mcp_client.call_tool(tool_name, tool_args)
-                if isinstance(result, str):
-                    text = result
-                else:
-                    text = _format_result_as_text(result)
-                yield _openai_sse_chunk(text)
-            pending_tool_calls.clear()
-            yield _openai_sse_chunk(finish_reason="stop")
-            yield "data: [DONE]\n\n"
+        msgs = list(messages)
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                async with client.stream("POST", llm_url, headers=headers, json=send_payload) as resp:
-                    if resp.status_code != 200:
-                        error_text = await resp.aread()
-                        logger.error(f"LLM API Error {resp.status_code}: {error_text}")
-                        yield _openai_sse_chunk(f"API Error: {resp.status_code}", finish_reason="stop")
+            for round_num in range(_MAX_TOOL_ROUNDS):
+                tool_calls_this_round: Optional[List[Dict[str, Any]]] = None
+                errored = False
+
+                async for kind, data in _stream_llm_round(msgs, llm_url, headers):
+                    if kind == "content":
+                        yield _openai_sse_chunk(data)
+                    elif kind == "tool_calls":
+                        tool_calls_this_round = data
+                    elif kind == "error":
+                        yield _openai_sse_chunk(data, finish_reason="stop")
                         yield "data: [DONE]\n\n"
-                        return
+                        errored = True
+                        break
+                    elif kind == "done":
+                        pass
 
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
+                if errored:
+                    return
 
-                        if line.startswith("data: "):
-                            data = line[6:]
-                        else:
-                            data = line
+                if not tool_calls_this_round:
+                    # Model produced its final natural-language answer.
+                    yield _openai_sse_chunk(finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+                    return
 
-                        if data.strip() == "[DONE]":
-                            async for event in execute_pending_tool_calls():
-                                yield event
-                            if not tools_executed:
-                                yield "data: [DONE]\n\n"
-                            break
+                # Execute each requested tool call, then feed the results
+                # back to the LLM so it can phrase a real answer.
+                assistant_tool_calls = []
+                tool_result_messages = []
 
-                        try:
-                            chunk = json.loads(data)
-                        except Exception as e:
-                            logger.debug(f"Failed to parse JSON: {e}")
-                            continue
+                for tc in tool_calls_this_round:
+                    function = tc.get("function") or {}
+                    tool_name = function.get("name")
+                    if not tool_name:
+                        continue
 
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
+                    raw_args = function.get("arguments", "")
+                    tool_args = raw_args if isinstance(raw_args, dict) else _normalize_tool_input(raw_args or {})
 
-                        for choice in choices:
-                            delta = choice.get("delta", {}) or {}
-                            finish_reason = choice.get("finish_reason")
+                    call_id = tc.get("id") or f"call_{round_num}_{tool_name}"
+                    assistant_tool_calls.append({
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(tool_args),
+                        },
+                    })
 
-                            if delta.get("tool_calls"):
-                                for tool_call in delta["tool_calls"]:
-                                    idx = tool_call.get("index", 0)
-                                    if idx not in pending_tool_calls:
-                                        pending_tool_calls[idx] = {
-                                            "id": tool_call.get("id"),
-                                            "function": {"name": "", "arguments": ""},
-                                        }
+                    try:
+                        mcp_client = await get_mcp_client()
+                        result = await mcp_client.call_tool(tool_name, tool_args)
+                        result_text = result if isinstance(result, str) else _format_result_as_text(result)
+                    except Exception as e:
+                        logger.error(f"Tool execution error for {tool_name}: {e}")
+                        result_text = f"Error executing {tool_name}: {e}"
 
-                                    if tool_call.get("id"):
-                                        pending_tool_calls[idx]["id"] = tool_call["id"]
+                    tool_result_messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": result_text,
+                    })
 
-                                    function = tool_call.get("function") or {}
-                                    if isinstance(function, str):
-                                        try:
-                                            function = json.loads(function)
-                                        except Exception:
-                                            function = {"name": function, "arguments": ""}
-                                    if not isinstance(function, dict):
-                                        function = {}
+                if not assistant_tool_calls:
+                    yield _openai_sse_chunk(finish_reason="stop")
+                    yield "data: [DONE]\n\n"
+                    return
 
-                                    if function.get("name"):
-                                        pending_tool_calls[idx]["function"]["name"] = function["name"]
-                                    if function.get("arguments") is not None:
-                                        pending_tool_calls[idx]["function"]["arguments"] += function["arguments"]
-                                continue
+                # Record the assistant's tool call request and the tool
+                # results in the conversation, then loop to let the LLM
+                # turn that data into a natural-language reply.
+                msgs.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": assistant_tool_calls,
+                })
+                msgs.extend(tool_result_messages)
 
-                            if finish_reason == "tool_calls":
-                                async for event in execute_pending_tool_calls():
-                                    yield event
-                                return
+            # Exhausted _MAX_TOOL_ROUNDS without a final natural-language answer.
+            logger.warning("Exceeded max tool-call rounds without a final answer")
+            yield _openai_sse_chunk(
+                "I gathered the data but ran into trouble summarizing it. Please try again.",
+                finish_reason="stop",
+            )
+            yield "data: [DONE]\n\n"
 
-                            if delta.get("content"):
-                                yield f"data: {json.dumps(chunk)}\n\n"
         except Exception as e:
             logger.error(f"Stream error: {e}")
             yield _openai_sse_chunk(f"Stream error: {e}", finish_reason="stop")
@@ -763,18 +824,18 @@ async def mcp_status():
     try:
         mcp_client = await get_mcp_client()
         is_connected = await mcp_client.is_connected()
-        
+
         tools = []
         if is_connected:
             tools = await mcp_client.get_tools()
-        
+
         return {
             "status": "connected" if is_connected else "disconnected",
             "mcp_server": "http://localhost:8001",
             "tools_available": len(tools),
             "mcp_enabled": True
         }
-    
+
     except Exception as e:
         logger.error(f"Error checking MCP status: {str(e)}")
         return {
@@ -792,13 +853,13 @@ async def health_check():
     try:
         mcp_client = await get_mcp_client()
         is_connected = await mcp_client.is_connected()
-        
+
         return {
             "status": "healthy" if is_connected else "degraded",
             "fastapi_connected": True,
             "mcp_connected": is_connected
         }
-    
+
     except Exception as e:
         return {
             "status": "unhealthy",
